@@ -70,7 +70,6 @@ Future<void> loadCalendarsFromLocal() async {
 Future<String> exportFinancialReport() async {
   final prefs = await SharedPreferences.getInstance();
 
-  // 1. Calculs des données globales en arrière-plan
   int totalCaisse = 0;
   int totalAttendu = 0;
   int totalPaye = 0;
@@ -140,7 +139,7 @@ Future<String> exportFinancialReport() async {
   );
   buffer.writeln('===========================================');
 
-  // 2. Simulation d'écriture sur fichier local pour le prototype
+  //  Simulation d'écriture sur fichier local pour le prototype
   // On sauvegarde une copie texte dans SharedPreferences pour l'historique d'export
   await prefs.setString('natt_last_printed_report', buffer.toString());
 
