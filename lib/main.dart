@@ -5,6 +5,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'dart:io';
 import 'package:image_picker/image_picker.dart';
 import 'package:local_auth/local_auth.dart';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 
 // ==========================================
 // VARIABLES GLOBALES (PERSISTANTES A BLANC)
@@ -12,6 +14,26 @@ import 'package:local_auth/local_auth.dart';
 List<Map<String, dynamic>> globalTontinesList = [];
 List<Map<String, dynamic>> globalMembersList = [];
 Map<String, dynamic>? currentConnectedMember;
+
+// ---------- SÉCURITÉ : HACHAGE DES MOTS DE PASSE (SHA-256 + SEL) ----------
+String generateSalt() {
+  final rnd = Random.secure();
+  final values = List<int>.generate(16, (_) => rnd.nextInt(256));
+  return base64UrlEncode(values);
+}
+
+String hashPassword(String password, String salt) {
+  return sha256.convert(utf8.encode('$salt:$password')).toString();
+}
+
+bool verifyPassword(String input, String salt, String storedHash) {
+  return hashPassword(input, salt) == storedHash;
+}
+
+// ---------- FORMAT DE DATE jj/mm/aaaa ----------
+String formatDate(DateTime d) {
+  return '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
+}
 
 // --- ALGORITHMES DE SAUVEGARDE LOCALE ---
 Future<void> saveTontinesToLocal() async {
@@ -165,13 +187,15 @@ Future<void> loadLastDrawDatesFromLocal() async {
 
 //Stockage dynamique des identifiants et informations de l'administrateur
 String globalAdminIdentifier = '';
-String globalAdminPassword = '';
+String globalAdminPassword = ''; // contient le HASH du mot de passe
+String globalAdminSalt = '';
 String globalAdminName = ''; // ◄ NOUVEAU : Mémorise le nom réel de l'admin
 
 Future<void> saveAdminCredentialsToLocal() async {
   final prefs = await SharedPreferences.getInstance();
   await prefs.setString('natt_admin_id', globalAdminIdentifier);
   await prefs.setString('natt_admin_pass', globalAdminPassword);
+  await prefs.setString('natt_admin_salt', globalAdminSalt);
   await prefs.setString(
     'natt_admin_name',
     globalAdminName,
@@ -182,6 +206,7 @@ Future<void> loadAdminCredentialsFromLocal() async {
   final prefs = await SharedPreferences.getInstance();
   globalAdminIdentifier = prefs.getString('natt_admin_id') ?? '';
   globalAdminPassword = prefs.getString('natt_admin_pass') ?? '';
+  globalAdminSalt = prefs.getString('natt_admin_salt') ?? '';
   globalAdminName =
       prefs.getString('natt_admin_name') ?? ''; // Chargement du nom
 }
@@ -268,7 +293,24 @@ class _LoginScreenState extends State<LoginScreen> {
     // 1. VÉRIFICATION DYNAMIQUE DE L'ADMINISTRATEUR
     if (globalAdminIdentifier.isNotEmpty &&
         input.toLowerCase() == globalAdminIdentifier.toLowerCase()) {
-      if (password == globalAdminPassword) {
+      bool adminOk;
+      if (globalAdminSalt.isEmpty) {
+        // Ancien compte en clair : on vérifie puis on convertit en hash
+        adminOk = password == globalAdminPassword;
+        if (adminOk) {
+          globalAdminSalt = generateSalt();
+          globalAdminPassword = hashPassword(password, globalAdminSalt);
+          saveAdminCredentialsToLocal();
+        }
+      } else {
+        adminOk = verifyPassword(
+          password,
+          globalAdminSalt,
+          globalAdminPassword,
+        );
+      }
+
+      if (adminOk) {
         Navigator.pushReplacement(
           context,
           MaterialPageRoute(builder: (context) => const AdminDashboard()),
@@ -291,15 +333,33 @@ class _LoginScreenState extends State<LoginScreen> {
     );
 
     if (memberFound.isNotEmpty) {
-      String savedPassword = memberFound['password'] ?? '';
-      if (savedPassword.isNotEmpty && savedPassword != password) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('mot de pass incorrect.'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-        return;
+      final String savedPassword = (memberFound['password'] ?? '').toString();
+      final String salt = (memberFound['salt'] ?? '').toString();
+
+      if (savedPassword.isNotEmpty) {
+        bool memberOk;
+        if (salt.isEmpty) {
+          // Ancien compte en clair : vérification puis conversion en hash
+          memberOk = savedPassword == password;
+          if (memberOk) {
+            final String newSalt = generateSalt();
+            memberFound['salt'] = newSalt;
+            memberFound['password'] = hashPassword(password, newSalt);
+            saveMembersToLocal();
+          }
+        } else {
+          memberOk = verifyPassword(password, salt, savedPassword);
+        }
+
+        if (!memberOk) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Mot de passe incorrect.'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+          return;
+        }
       }
 
       currentConnectedMember = memberFound;
@@ -579,9 +639,11 @@ class _RegisterScreenState extends State<RegisterScreen> {
     // CAS 1 : ENREGISTREMENT ADMINISTRATEUR
     // ==========================================
     if (_selectedRole == 'admin') {
+      final String adminSalt = generateSalt();
       setState(() {
         globalAdminIdentifier = identifier;
-        globalAdminPassword = password;
+        globalAdminSalt = adminSalt;
+        globalAdminPassword = hashPassword(password, adminSalt);
         globalAdminName = extraValue; // Enregistre le nom saisi
       });
 
@@ -608,8 +670,13 @@ class _RegisterScreenState extends State<RegisterScreen> {
     );
 
     if (memberIndex != -1) {
+      final String memberSalt = generateSalt();
       setState(() {
-        globalMembersList[memberIndex]['password'] = password;
+        globalMembersList[memberIndex]['salt'] = memberSalt;
+        globalMembersList[memberIndex]['password'] = hashPassword(
+          password,
+          memberSalt,
+        );
         globalMembersList[memberIndex]['email'] =
             extraValue; // lie l'email saisi à la fiche du membre
       });
@@ -1501,6 +1568,7 @@ class _CreateTontineScreenState extends State<CreateTontineScreen> {
   final _amountController = TextEditingController();
   final _membersCountController = TextEditingController();
   final _socialCotisationController = TextEditingController();
+  final _descriptionController = TextEditingController();
   String _selectedFrequency = 'Mensuelle';
 
   @override
@@ -1509,6 +1577,7 @@ class _CreateTontineScreenState extends State<CreateTontineScreen> {
     _amountController.dispose();
     _membersCountController.dispose();
     _socialCotisationController.dispose();
+    _descriptionController.dispose();
     super.dispose();
   }
 
@@ -1540,6 +1609,16 @@ class _CreateTontineScreenState extends State<CreateTontineScreen> {
                   ),
                   validator: (value) =>
                       value!.isEmpty ? 'Veuillez saisir un nom' : null,
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: _descriptionController,
+                  maxLines: 2,
+                  decoration: const InputDecoration(
+                    labelText: 'Description (facultatif)',
+                    border: OutlineInputBorder(),
+                    prefixIcon: Icon(Icons.notes_rounded),
+                  ),
                 ),
                 const SizedBox(height: 16),
                 TextFormField(
@@ -1622,6 +1701,8 @@ class _CreateTontineScreenState extends State<CreateTontineScreen> {
                             ? '0'
                             : _socialCotisationController.text.trim(),
                         'social_caisse_total': '0', // Démarre sagement à 0 FCFA
+                        'description': _descriptionController.text.trim(),
+                        'date_creation': formatDate(DateTime.now()),
                       });
                       globalCalendarsMap[tontineName] = <Map<String, String>>[];
                       await saveTontinesToLocal();
@@ -1757,6 +1838,9 @@ class _TontineListScreenState extends State<TontineListScreen> {
                           'Cotisation : ${tontine['montant']} (${tontine['frequence']})',
                         ),
                         Text('Quota : ${tontine['membres']}'),
+                        if ((tontine['description'] ?? '').toString().isNotEmpty)
+                          Text('Description : ${tontine['description']}'),
+                        Text('Créée le : ${tontine['date_creation'] ?? '—'}'),
                         Text(
                           'Cotisation Sociale : ${tontine['social_cotisation'] ?? '0'} FCFA / tour',
                         ),
@@ -1859,6 +1943,8 @@ class _TontineListScreenState extends State<TontineListScreen> {
                                           member['status_$tontineName'] =
                                               'En attente';
                                           member.remove('tx_$tontineName');
+                                          member.remove('paydate_$tontineName');
+                                          member.remove('mode_$tontineName');
                                         }
                                       }
                                     });
@@ -1967,6 +2053,7 @@ class _TontineEditDialogState extends State<TontineEditDialog> {
   late TextEditingController _nameController;
   late TextEditingController _amountController;
   late TextEditingController _membersCountController;
+  late TextEditingController _descriptionController;
   late String _dialogueFrequency;
 
   @override
@@ -1996,6 +2083,9 @@ class _TontineEditDialogState extends State<TontineEditDialog> {
     }
 
     _membersCountController = TextEditingController(text: currentMaxMembers);
+    _descriptionController = TextEditingController(
+      text: (globalTontinesList[widget.index]['description'] ?? '').toString(),
+    );
     _dialogueFrequency =
         globalTontinesList[widget.index]['frequence'] ?? 'Mensuelle';
   }
@@ -2005,6 +2095,7 @@ class _TontineEditDialogState extends State<TontineEditDialog> {
     _nameController.dispose();
     _amountController.dispose();
     _membersCountController.dispose();
+    _descriptionController.dispose();
     super.dispose();
   }
 
@@ -2019,6 +2110,10 @@ class _TontineEditDialogState extends State<TontineEditDialog> {
             TextField(
               controller: _nameController,
               decoration: const InputDecoration(labelText: 'Nom de la tontine'),
+            ),
+            TextField(
+              controller: _descriptionController,
+              decoration: const InputDecoration(labelText: 'Description'),
             ),
             TextField(
               controller: _amountController,
@@ -2054,12 +2149,23 @@ class _TontineEditDialogState extends State<TontineEditDialog> {
         ),
         ElevatedButton(
           onPressed: () async {
+            // Compte réel des inscrits (calculé avec l'ANCIEN nom, avant renommage)
+            final String ancienNom = globalTontinesList[widget.index]['nom']
+                .toString();
+            final int inscritsReels = globalMembersList.where((m) {
+              final List<dynamic> tl = m['tontines'] is List
+                  ? m['tontines']
+                  : [];
+              return tl.contains(ancienNom);
+            }).length;
             globalTontinesList[widget.index]['nom'] = _nameController.text;
+            globalTontinesList[widget.index]['description'] =
+                _descriptionController.text.trim();
             globalTontinesList[widget.index]['montant'] =
                 '${_amountController.text} FCFA';
             globalTontinesList[widget.index]['frequence'] = _dialogueFrequency;
             globalTontinesList[widget.index]['membres'] =
-                '0 / ${_membersCountController.text} membres';
+                '$inscritsReels / ${_membersCountController.text} membres';
             await saveTontinesToLocal();
             widget.onSave();
             if (!mounted) return;
@@ -2132,12 +2238,14 @@ class AddMemberScreen extends StatefulWidget {
 
 class _AddMemberScreenState extends State<AddMemberScreen> {
   final _formKey = GlobalKey<FormState>();
-  final _nameController = TextEditingController();
+  final _firstNameController = TextEditingController();
+  final _lastNameController = TextEditingController();
   final _phoneController = TextEditingController();
 
   @override
   void dispose() {
-    _nameController.dispose();
+    _firstNameController.dispose();
+    _lastNameController.dispose();
     _phoneController.dispose();
     super.dispose();
   }
@@ -2159,11 +2267,21 @@ class _AddMemberScreenState extends State<AddMemberScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               TextFormField(
-                controller: _nameController,
+                controller: _firstNameController,
                 decoration: const InputDecoration(
-                  labelText: 'Nom et Prénom',
+                  labelText: 'Prénom',
                   border: OutlineInputBorder(),
                   prefixIcon: Icon(Icons.person),
+                ),
+                validator: (value) => value!.isEmpty ? 'Prénom requis' : null,
+              ),
+              const SizedBox(height: 16),
+              TextFormField(
+                controller: _lastNameController,
+                decoration: const InputDecoration(
+                  labelText: 'Nom',
+                  border: OutlineInputBorder(),
+                  prefixIcon: Icon(Icons.person_outline),
                 ),
                 validator: (value) => value!.isEmpty ? 'Nom requis' : null,
               ),
@@ -2183,11 +2301,16 @@ class _AddMemberScreenState extends State<AddMemberScreen> {
               ElevatedButton(
                 onPressed: () async {
                   if (_formKey.currentState!.validate()) {
+                    final String prenom = _firstNameController.text.trim();
+                    final String nomFamille = _lastNameController.text.trim();
                     globalMembersList.add({
-                      'nom': _nameController.text,
+                      'prenom': prenom,
+                      'nom_famille': nomFamille,
+                      'nom': '$prenom $nomFamille', // nom complet utilisé partout
                       'telephone': _phoneController.text,
                       'tontines': <String>[],
                       'status': 'Actif',
+                      'date_creation': formatDate(DateTime.now()),
                     });
                     await saveMembersToLocal();
                     if (!mounted) return;
@@ -2369,6 +2492,8 @@ class _AssignTontineScreenState extends State<AssignTontineScreen> {
                       );
                       globalMembersList[memberIndex]['status_${tontine['nom']}'] =
                           'En attente';
+                      globalMembersList[memberIndex]['adhesion_${tontine['nom']}'] =
+                          formatDate(DateTime.now());
                       tontine['membres'] =
                           '${inscritsActuels + 1} / $maxPermis membres';
                     });
@@ -2589,6 +2714,9 @@ class _ValidatePaymentsScreenState extends State<ValidatePaymentsScreen> {
                 }
                 member.remove(statusKey);
                 member.remove('tx_$tontineName');
+                member.remove('adhesion_$tontineName');
+                member.remove('paydate_$tontineName');
+                member.remove('mode_$tontineName');
               });
               await saveMembersToLocal();
               if (!mounted) return;
@@ -2890,7 +3018,7 @@ class TontineMembersListScreen extends StatelessWidget {
                                   ),
                                 ),
                                 subtitle: Text(
-                                  'Téléphone : ${currentMember['telephone']}',
+                                  'Téléphone : ${currentMember['telephone']}\nAdhésion : ${currentMember['adhesion_$tontineName'] ?? '—'}',
                                 ),
                                 trailing: Container(
                                   padding: const EdgeInsets.symmetric(
@@ -3476,6 +3604,8 @@ class _PaymentHistoryScreenState extends State<PaymentHistoryScreen> {
           'memberIndex': memberIndex,
           'statusKey': statusKey,
           'txKey': txKey,
+          'paydate': (member['paydate_$tontineName'] ?? '').toString(),
+          'mode': (member['mode_$tontineName'] ?? '').toString(),
         });
       }
     }
@@ -3563,7 +3693,7 @@ class _PaymentHistoryScreenState extends State<PaymentHistoryScreen> {
                               left: 4.0,
                             ),
                             child: Text(
-                              'Ref Réf : ${payment['transaction']}',
+                              'Réf : ${payment['transaction']}${payment['paydate'].toString().isNotEmpty ? '  •  Payé le ${payment['paydate']} via ${payment['mode']}' : ''}',
                               style: const TextStyle(
                                 fontStyle: FontStyle.italic,
                                 color: Colors.grey,
@@ -3709,6 +3839,10 @@ class _PaymentHistoryScreenState extends State<PaymentHistoryScreen> {
       final int randomCode = 100000 + DateTime.now().millisecond;
       globalMembersList[idx][payment['txKey']] =
           '${provider == 'Wave' ? 'WAVE' : 'OM'}-$randomCode-${montantExact}F';
+      globalMembersList[idx]['paydate_${payment['tontine']}'] = formatDate(
+        DateTime.now(),
+      );
+      globalMembersList[idx]['mode_${payment['tontine']}'] = provider;
 
       if (currentConnectedMember != null &&
           currentConnectedMember!['nom'] == globalMembersList[idx]['nom']) {
@@ -3932,7 +4066,15 @@ class _MemberProfileScreenState extends State<MemberProfileScreen> {
               // --- CORRECTION CRITIQUE ---
               // Si le mot de passe en mémoire est vide (compte de test initial),
               // ou si la saisie ne correspond pas, on applique la vérification textuelle.
-              if (currentPass.isNotEmpty && oldPass != currentPass) {
+              final String currentSalt =
+                  (currentConnectedMember?['salt'] ?? '').toString();
+              final bool oldOk =
+                  currentPass.isEmpty ||
+                  (currentSalt.isEmpty
+                      ? oldPass == currentPass
+                      : verifyPassword(oldPass, currentSalt, currentPass));
+
+              if (!oldOk) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
                     content: Text('Ancien code secret incorrect.'),
@@ -3953,10 +4095,14 @@ class _MemberProfileScreenState extends State<MemberProfileScreen> {
               );
 
               if (idx != -1) {
+                final String newSalt = generateSalt();
+                final String newHash = hashPassword(newPass, newSalt);
                 setState(() {
-                  globalMembersList[idx]['password'] = newPass;
+                  globalMembersList[idx]['salt'] = newSalt;
+                  globalMembersList[idx]['password'] = newHash;
+                  currentConnectedMember!['salt'] = newSalt;
                   currentConnectedMember!['password'] =
-                      newPass; // Synchronise la session active
+                      newHash; // Synchronise la session active
                 });
 
                 await saveMembersToLocal(); // Fixe le nouveau mot de passe dans SharedPreferences
